@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.x.codex-bridge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/x/ai-assets/codex-proxy/proxy.py</string>
+		<string>--listen-port</string>
+		<string>11434</string>
+		<string>--ollama-url</string>
+		<string>http://localhost:11433</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/x/ai-worklogs/codex-bridge.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/x/ai-worklogs/codex-bridge.err.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/Users/x</string>
+	</dict>
+</dict>
+</plist>
