@@ -166,6 +166,7 @@ codex-proxy/
 | Technical Report | 中文 | [paper/technical-report-zh.md](paper/technical-report-zh.md) |
 | LaTeX Preprint | English | [paper/paper.tex](paper/paper.tex) → [paper.pdf](paper/paper.pdf) |
 | Blog Post | 中文 | [掘金：让本地模型在 Codex 里调用工具](https://juejin.cn/post/7641409122262040582) |
+| Preprint (DOI) | English | [ResearchGate: 10.13140/RG.2.2.10726.79680](https://doi.org/10.13140/RG.2.2.10726.79680) |
 
 ```
 @misc{xuanyuan2026ptb,
