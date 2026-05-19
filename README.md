@@ -1,3 +1,22 @@
+---
+language:
+- en
+- zh
+license: mit
+tags:
+- tool-calling
+- llm
+- ollama
+- codex
+- proxy
+- protocol-translation
+- openai-api
+- local-models
+- sse
+- agent-framework
+pretty_name: Codex-Ollama Protocol Bridge
+---
+
 # Codex-Ollama Protocol Bridge
 
 **Lightweight protocol translation proxy enabling local Ollama models to use Codex CLI tools.**
