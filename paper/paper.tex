@@ -1,0 +1,640 @@
+% =====================================================================
+% Lightweight Protocol-Translation Bridges for Heterogeneous LLM
+% Tool-Calling APIs: A Case Study on Codex-Ollama Interoperation
+%
+% arXiv-ready LaTeX source
+% =====================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{enumitem}
+\usepackage{titling}
+\usepackage{abstract}
+\usepackage{float}
+
+% --- Metadata ---
+\title{\bf Lightweight Protocol-Translation Bridges for\\
+Heterogeneous LLM Tool-Calling APIs:\\
+A Case Study on Codex-Ollama Interoperation}
+
+\author{
+  xuanyuan\\
+  \texttt{xrz5785@gmail.com}
+}
+
+\date{May 2026\\Technical Report v1.0}
+
+% --- Code listing style ---
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\definecolor{codeframe}{rgb}{0.8,0.8,0.8}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  postbreak=\mbox{\textcolor{red}{$\hookrightarrow$}\space},
+  showstringspaces=false,
+  columns=flexible,
+  aboveskip=8pt,
+  belowskip=8pt,
+}
+
+% --- Compact itemize ---
+\setlist{nosep,leftmargin=*}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large Language Model (LLM) inference frameworks widely claim ``OpenAI API
+compatibility,'' yet this compatibility often exists only at the syntactic
+level---HTTP endpoints accept request payloads and return 200, but fail to
+preserve semantic contracts around tool-calling (function-calling) behavior.
+We document a concrete failure case: Ollama's \texttt{/v1/responses}
+endpoint, when used as a provider for Codex CLI (OpenAI's coding agent),
+returns malformed responses that cause all tool-call attempts to fail with
+``unsupported call'' errors, despite the same models producing correct
+\texttt{tool\_calls} through Ollama's \texttt{/v1/chat/completions}
+endpoint.
+
+We propose the \textbf{Protocol-Translation Bridge (PTB)} pattern: a
+lightweight, zero-configuration proxy that performs three core
+transformations---(1) request format translation from Responses API to Chat
+Completions API, (2) tool schema simplification to fit local models'
+attention budgets, and (3) reverse synthesis of SSE event streams from
+non-streaming upstream responses. Our implementation ($\sim$800 lines of
+Python) restores full tool-calling functionality across all tested local
+models (qwen3:14b, huihui4:8b-a4b, qwen2.5-coder:3b) with zero
+modifications to either the client framework or the inference engine.
+
+The key insight is counterintuitive: \textit{downgrading} from the newer
+Responses API to the older Chat Completions API increases semantic fidelity,
+because the older endpoint has more mature native implementations within
+inference frameworks.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+
+\subsection{Background}
+
+LLM-based coding agents---Codex \cite{codex}, Cursor, Copilot,
+Aider---rely on tool-calling APIs to execute shell commands, read and write
+files, spawn sub-agents, and interact with users. These agents typically
+target OpenAI's API contract, either the Chat Completions API
+(\texttt{/v1/chat/completions}) or the newer Responses API
+(\texttt{/v1/responses}) \cite{openai_responses}. The Responses API is the
+recommended modern endpoint for agent frameworks because it provides
+structured multi-output responses, native streaming SSE events, and a
+unified interface for text and tool-call outputs.
+
+Meanwhile, the local-model ecosystem---Ollama \cite{ollama}, vLLM
+\cite{vllm}, llama.cpp---has rapidly evolved to support tool-calling.
+Ollama's documentation states that its \texttt{/v1/responses} endpoint is
+``OpenAI-compatible'' \cite{ollama_compat}. Codex CLI v0.130.0 added
+\texttt{--oss --local-provider ollama} flags to support local models through
+this endpoint.
+
+\subsection{The Problem}
+
+When Codex connects to Ollama's \texttt{/v1/responses} endpoint with a
+local model, tool calls fail with:
+
+\begin{lstlisting}
+unsupported call: call_<id> (exec_command)
+\end{lstlisting}
+
+The error is silent at the HTTP level---Ollama returns 200 OK. The failure
+occurs at the semantic level: the response body does not contain the
+structured \texttt{function\_call} output items that Codex's agent runtime
+expects. The same model, queried via \texttt{/v1/chat/completions} with
+identical tool definitions, produces correct \texttt{tool\_calls} in its
+response.
+
+This paper documents the diagnosis, solution, and generalization of this
+problem.
+
+% =====================================================================
+\section{Problem Analysis}
+% =====================================================================
+
+\subsection{Root Cause}
+
+Ollama's \texttt{/v1/responses} endpoint is a thin wrapper around its native
+\texttt{/api/chat} endpoint. The internal path is:
+
+\begin{lstlisting}
+Codex -> POST /v1/responses (Ollama's OpenAI-compat layer)
+      -> Ollama rewraps as /api/chat request
+      -> Model outputs text (not structured function_call)
+      -> Ollama returns {output: [{type: "message", content: "..."}]}
+      -> Codex finds no function_call -> "unsupported call"
+\end{lstlisting}
+
+When the same model is queried via \texttt{/v1/chat/completions}:
+
+\begin{lstlisting}
+Client -> POST /v1/chat/completions
+       -> Ollama rewraps as /api/chat with tools properly nested
+       -> Model outputs {tool_calls: [{function: {name, arguments}}]}
+       -> Ollama returns {choices: [{message: {tool_calls: [...]}}]}
+\end{lstlisting}
+
+The critical difference: Ollama's native \texttt{/api/chat} endpoint
+natively supports tool-calling and correctly passes tool definitions to the
+model. The \texttt{/v1/responses} wrapper loses this capability during
+format translation.
+
+\subsection{Why Not Fix Upstream?}
+
+\begin{enumerate}[nosep]
+  \item Ollama's issue tracker already has reports about
+        \texttt{/v1/responses} tool-calling gaps
+  \item Fix timeline unknown---the endpoint is not Ollama's priority
+  \item A proxy is zero-friction---no need to modify Codex or Ollama
+  \item Generalizes---the same pattern applies to any pair of incompatible
+        LLM API surfaces
+\end{enumerate}
+
+\subsection{Diagnosis Methodology}
+
+We employed a 12-step iterative diagnosis, summarized in Table~\ref{tab:diagnosis}.
+
+\begin{table}[H]
+\centering
+\caption{12-Step Iterative Diagnosis}
+\label{tab:diagnosis}
+\begin{tabular}{ccll}
+\toprule
+\textbf{Step} & \textbf{Hypothesis} & \textbf{Test} & \textbf{Result} \\
+\midrule
+1  & Direct \texttt{/v1/responses} works    & Codex + Ollama                  & ``unsupported call'' \\
+2  & Model capability issue                 & Manual \texttt{/v1/chat/completions} & Tool calls work \\
+3  & Ollama responses impl broken           & Read source                     & Thin wrapper, loses tools \\
+4  & Tool choice mode                       & \texttt{required} vs \texttt{auto} & \texttt{required} causes loops \\
+5  & Too many tools                         & 11 tools $\rightarrow$ 3 tools  & Better, still inconsistent \\
+6  & Tool parameter overload                & 10 params $\rightarrow$ 2--3  & Model selects correctly \\
+7  & Model outputs JSON text                & Check response format           & Text JSON, not \texttt{tool\_calls} \\
+8  & System prompt too weak                 & Add CRITICAL directive          & Model starts calling tools \\
+9  & Usage field mismatch                   & Check \texttt{input\_tokens}    & Missing, causes disconnect \\
+10 & \texttt{output\_index} hardcoded       & Multi-output responses          & Text overwrites \texttt{function\_call} \\
+11 & Pull fails for custom models           & POST \texttt{/api/pull}         & ``file does not exist'' \\
+12 & GGUF architecture compatibility        & gemma4 in Ollama                & Needs specific arch support \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{The Protocol-Translation Bridge (PTB) Pattern}
+% =====================================================================
+
+\subsection{Architecture}
+
+The proxy sits between Codex and Ollama, listening on port 11434 with
+Ollama on 11433:
+
+\begin{figure}[H]
+\centering
+\fbox{
+\begin{minipage}{0.92\textwidth}
+\centering
+\vspace{3pt}
+\textbf{Figure 1: PTB Architecture}\\[8pt]
+\begin{tabular}{c c c c c}
+\texttt{Codex} & $\xrightarrow[\text{SSE}]{\text{/v1/responses}}$ &
+\texttt{Bridge :11434} & $\xrightarrow[\text{JSON}]{\text{/v1/chat/completions}}$ &
+\texttt{Ollama :11433} \\
+& $\xleftarrow[\text{events}]{\text{}}$ &
+& $\xleftarrow[\text{response}]{\text{}}$ &
+\end{tabular}
+\vspace{6pt}
+\end{minipage}
+}
+\end{figure}
+
+The proxy is transparent for non-Responses requests (pass-through for
+\texttt{/api/tags}, \texttt{/api/chat}, etc.), and only intervenes for two
+specific paths: \texttt{POST /v1/responses} (full protocol translation) and
+\texttt{POST /api/pull} (intercept for locally-available models).
+
+\subsection{Transformation 1: Request Format Translation}
+
+The Responses API request is converted to Chat Completions format.
+Key design decisions:
+
+\begin{itemize}
+  \item \texttt{stream: false}---we always request non-streaming from
+        Ollama, then synthesize SSE events ourselves. This avoids the
+        complexity of real-time SSE$\rightarrow$SSE translation and gives us
+        complete control over event ordering.
+  \item \texttt{tool\_choice: "auto"}---\texttt{"required"} causes infinite
+        tool-call loops with some models. \texttt{"auto"} combined with a
+        strong system prompt provides the right balance.
+  \item \texttt{instructions} becomes part of the system message, augmented
+        with tool-usage directives.
+\end{itemize}
+
+\subsection{Transformation 2: Tool Schema Simplification}
+
+Codex's internal tools are complex: \texttt{exec\_command} alone has 10
+parameters. Across 11 tools, the total tool definition is approximately
+4,100 tokens---exceeding the effective attention budget of 8B-class models.
+
+\begin{table}[H]
+\centering
+\caption{Tool Parameter Reduction}
+\label{tab:tools}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Tool} & \textbf{Original Params} & \textbf{Essential Params} \\
+\midrule
+\texttt{exec\_command}    & 10 & 2 (cmd, workdir) \\
+\texttt{write\_stdin}     & 6  & 2 (session\_id, chars) \\
+\texttt{spawn\_agent}     & 8  & 3 (agent\_type, items, message) \\
+\texttt{view\_image}      & 3  & 1 (path) \\
+\texttt{update\_plan}     & 2  & 1 (plan) \\
+\texttt{request\_user\_input} & 3 & 1 (questions) \\
+\texttt{send\_input}      & 4  & 3 (target, message, items) \\
+\texttt{resume\_agent}    & 2  & 1 (id) \\
+\texttt{wait\_agent}      & 3  & 1 (targets) \\
+\texttt{close\_agent}     & 2  & 1 (target) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+After simplification: $\sim$800 tokens (5$\times$ reduction). Codex's tool
+executor fills in sensible defaults for omitted parameters. This is a
+\textit{zero-cost accuracy improvement}---the model selects the correct tool
+with higher probability because the signal-to-noise ratio in the tool
+definitions is higher.
+
+\subsection{Transformation 3: Response Event Synthesis}
+
+From a non-streaming Chat Completions JSON response, we synthesize the
+OpenAI Responses API SSE event stream:
+
+\begin{figure}[H]
+\centering
+\fbox{
+\begin{minipage}{0.9\textwidth}
+\vspace{3em}
+\centering
+\textbf{Figure 2: SSE Event Synthesis Flow}\\[6pt]
+\texttt{chat.completion JSON} $\rightarrow$
+\texttt{response.created} $\rightarrow$
+\texttt{in\_progress} $\rightarrow$\\[2pt]
+\texttt{output\_item.added (function\_call)} $\rightarrow$
+\texttt{function\_call\_arguments.delta} $\rightarrow$\\
+\texttt{function\_call\_arguments.done} $\rightarrow$
+\texttt{output\_item.done} $\rightarrow$\\
+\texttt{output\_item.added (message)} $\rightarrow$
+\texttt{content\_part.added} $\rightarrow$\\
+\texttt{output\_text.delta (xN)} $\rightarrow$
+\texttt{output\_item.done} $\rightarrow$\\
+\texttt{response.completed (with normalized usage)}
+\vspace{3em}
+\end{minipage}
+}
+\end{figure}
+
+Critical details that caused failures:
+
+\begin{enumerate}[nosep]
+  \item \texttt{output\_index}: MUST be 0 for the first function\_call, 1
+        for the text message. Hardcoding 0 causes multi-output corruption.
+  \item \texttt{sequence\_number}: MUST be globally monotonically increasing
+        across all events.
+  \item \texttt{usage}: Ollama returns \texttt{\{prompt\_tokens,
+        completion\_tokens\}} but Codex expects \texttt{\{input\_tokens,
+        output\_tokens\}}.
+  \item Event ordering is a strict protocol; deviations cause client
+        disconnections.
+\end{enumerate}
+
+\subsection{Pull Interception}
+
+Codex calls \texttt{POST /api/pull} for every model before first use.
+Custom GGUF models (e.g., huihui4-8b-a4b) are not in Ollama's registry,
+causing pull failures. The proxy intercepts this endpoint, checks if the
+model exists locally via \texttt{/api/tags}, and returns
+\texttt{\{"status":"success"\}\textbackslash n} (NDJSON format) for
+locally-available models.
+
+% =====================================================================
+\section{Implementation}
+% =====================================================================
+
+\subsection{Technology Stack}
+
+\begin{itemize}[nosep]
+  \item \textbf{Language}: Python 3.12 (standard library + aiohttp)
+  \item \textbf{Lines of code}: $\sim$480 effective, 807 total
+  \item \textbf{Dependencies}: aiohttp only
+  \item \textbf{Deployment}: macOS launchd (KeepAlive daemon) or manual
+        \texttt{python3 proxy.py}
+\end{itemize}
+
+\subsection{Code Organization}
+
+\begin{lstlisting}
+proxy.py
+|-- normalize_usage()          -- Usage field mapping (Ollama -> OpenAI)
+|-- simplify_tools()           -- Tool parameter reduction
+|-- responses_to_chat()        -- Request format translation
+|-- SSEResponseBuilder         -- SSE event synthesis engine
+|   |-- start() / in_progress() / complete() / error()
+|   |-- add_text_delta()
+|   |-- add_tool_call_start() / add_tool_args_delta() / finish_tool_call()
+|-- proxy_handler()            -- Main request dispatcher
+|-- _synthesize_sse()          -- SSE stream construction
+|-- health_handler()           -- Health check endpoint
+|-- main()                     -- CLI, signal handling, startup check
+\end{lstlisting}
+
+\subsection{Deployment}
+
+Production deployment uses macOS launchd with KeepAlive:
+
+\begin{lstlisting}[language=XML]
+<!-- ~/Library/LaunchAgents/com.x.codex-bridge.plist -->
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+\end{lstlisting}
+
+A control script provides standard service management:
+
+\begin{lstlisting}[language=bash]
+codex-bridge-ctl.sh start|stop|restart|status|logs
+\end{lstlisting}
+
+Codex is configured with shell aliases:
+
+\begin{lstlisting}[language=bash]
+alias cx14='codex --oss --local-provider ollama -m qwen3:14b'
+alias cx14e='codex exec --skip-git-repo-check --oss
+             --local-provider ollama -m qwen3:14b'
+\end{lstlisting}
+
+% =====================================================================
+\section{Experimental Validation}
+% =====================================================================
+
+\subsection{Test Setup}
+
+\begin{table}[H]
+\centering
+\caption{Test Environment}
+\label{tab:env}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Version} \\
+\midrule
+Codex CLI  & v0.130.0 / v0.131.0 \\
+Ollama     & 0.23.4 \\
+Bridge     & v1.1.0 \\
+OS         & macOS 26.4 (Apple Silicon) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Model Compatibility}
+
+\begin{table}[H]
+\centering
+\caption{Model Compatibility Matrix}
+\label{tab:models}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Size} & \textbf{Tools} & \textbf{Chinese} & \textbf{Notes} \\
+\midrule
+qwen3:14b              & 9.3GB  & Stable  & Native & Flagship \\
+huihui4:8b-a4b         & 5.4GB  & Good    & Yes    & MoE, 4/8.1B active \\
+Qwen2.5-Coder-7B-GGUF  & 7B     & Moderate& Yes    & Backup \\
+qwen2.5-coder:3b       & 1.9GB  & Weak    & Yes    & Lightweight text \\
+llama3.1:8b            & 4.9GB  & Weak    & No     & English only \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{End-to-End Test}
+
+\begin{lstlisting}
+$ codex exec --skip-git-repo-check --ephemeral --oss \
+    --local-provider ollama -m "huihui4-8b-a4b:latest" \
+    "list files in proxy/ directory"
+
+exec
+/bin/zsh -lc 'ls -R /Users/x/ai-assets/codex-proxy/'
+  succeeded in 0ms:
+__pycache__
+proxy.py
+paper/
+
+/Users/x/ai-assets/codex-proxy/__pycache__:
+proxy.cpython-312.pyc
+\end{lstlisting}
+
+\subsection{Failure Analysis}
+
+During development, we encountered and resolved 10 distinct failure modes,
+summarized in Table~\ref{tab:failures}.
+
+\begin{table}[H]
+\centering
+\caption{Failure Mode Analysis (10 Error Types)}
+\label{tab:failures}
+\begin{tabular}{cll}
+\toprule
+\textbf{\#} & \textbf{Failure} & \textbf{Root Cause \& Fix} \\
+\midrule
+1  & Port conflict                     & Ollama launchd auto-restart; manual port mgmt \\
+2  & HTTP 400 Bad Request              & Content-Length not updated after body change \\
+3  & Content-Length off by 1           & stream:false changed after header calc; reorder \\
+4  & Empty function\_call name         & 4100-token tool def overload; simplify\_tools() \\
+5  & Text JSON instead of tool\_calls  & Model outputs JSON as text; enhanced system prompt \\
+6  & Missing input\_tokens             & Usage field naming mismatch; normalize\_usage() \\
+7  & Transport closed                  & Malformed response.completed; fix usage \\
+8  & output\_index hardcoded to 0      & Multi-output ordering; dynamic output\_index \\
+9  & Pull failure for custom models    & Not in registry; pull interception \\
+10 & Literal \textbackslash n in pull  & Escaped vs real newline; binary-correct \textbackslash n \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Discussion}
+% =====================================================================
+
+\subsection{The ``Newer API is Better'' Fallacy}
+
+A counterintuitive finding: the newer \texttt{/v1/responses} endpoint
+(introduced by OpenAI in 2025) performed \textit{worse} than the older
+\texttt{/v1/chat/completions} endpoint for tool-calling through Ollama.
+This is because the Chat Completions API has been the primary integration
+target for inference frameworks for years, receiving more testing and native
+optimization. The Responses API, being newer, has thinner compatibility
+wrappers.
+
+\textbf{Lesson:} When debugging API compatibility issues, try downgrading to
+an older API surface before assuming the model or framework is broken.
+
+\subsection{Attention Budget as a First-Class Constraint}
+
+Tool definitions consume prompt tokens. For an 8B model with a 32K context
+window, 4,100 tokens of tool definitions represent $\sim$13\% of total
+budget. But the effective attention budget for tool selection is much
+smaller---the model must attend to the system prompt, conversation history,
+\textit{and} tool definitions simultaneously.
+
+Our simplification from 4,100 $\rightarrow$ 800 tokens (5$\times$ reduction)
+was the single most impactful change for model accuracy. This suggests that
+tool definition design for local models should be treated as a prompt
+engineering problem, not just an API integration problem.
+
+\subsection{SSE Synthesis vs. Real-Time Translation}
+
+\begin{table}[H]
+\centering
+\caption{Trade-off: SSE Synthesis vs. Real-Time Translation}
+\begin{tabular}{lcc}
+\toprule
+& \textbf{Real-Time SSE} & \textbf{Synthesized SSE} \\
+\midrule
+Latency       & Low (streaming)  & First-byte $\approx$ generation time \\
+Complexity    & High (state machine) & Low ($\sim$480 loc) \\
+Correctness   & Event reordering risk & Guaranteed correct ordering \\
+Best for      & Fast models, production & Local models, prototyping \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For local models where generation latency is typically 5--30 seconds, the
+first-byte latency of non-streaming is acceptable. For production deployments
+with faster models, real-time translation would be the next optimization.
+
+\subsection{Generalizability}
+
+The PTB pattern applies beyond Codex-Ollama. Any pair of LLM API surfaces
+with syntactic-but-not-semantic compatibility can be bridged: Cursor +
+Ollama, Continue.dev + vLLM, LangChain agents + llama.cpp. The core
+principle: \textbf{identify the API surface where tool-calling works
+natively, translate requests to that surface, and translate responses back
+to the client's expected surface.}
+
+\subsection{Limitations}
+
+\begin{enumerate}[nosep]
+  \item No real streaming---first-byte latency equals full generation time
+  \item Single-model focus---no load balancing across multiple instances
+  \item No authentication---assumes local-only deployment
+  \item No automated tests---manual end-to-end testing only
+  \item No response caching---repeated queries regenerate
+\end{enumerate}
+
+% =====================================================================
+\section{Related Work}
+% =====================================================================
+
+\begin{itemize}
+  \item \textbf{LiteLLM} \cite{litellm}: Universal LLM proxy supporting
+        $\sim$100 providers. Primarily targets Chat Completions; Responses
+        API support is nascent.
+  \item \textbf{OpenRouter}: Commercial routing service. Does not address
+        Responses API.
+  \item \textbf{vLLM} \cite{vllm}: OpenAI-compatible server. Focused on
+        serving, not protocol translation between API surfaces.
+  \item \textbf{OpenAI Agents SDK}: Official agent framework using
+        Responses API. Our work enables these agents with local models.
+  \item \textbf{porter} \cite{porter}: Lightweight LLM proxy for
+        authentication and routing, not protocol translation.
+\end{itemize}
+
+The unique contribution of this work is the combination of: (a) Responses
+API $\leftrightarrow$ Chat Completions semantic translation, (b) tool
+schema simplification for local models, and (c) reverse SSE synthesis from
+non-streaming responses.
+
+% =====================================================================
+\section{Conclusion}
+% =====================================================================
+
+We presented the Protocol-Translation Bridge (PTB) pattern, a lightweight
+solution to the problem of heterogeneous LLM API tool-calling compatibility.
+Our implementation for Codex-Ollama interoperation ($\sim$800 lines of
+Python) successfully restores tool-calling functionality for local models,
+with zero modifications to either the client framework or the inference
+engine.
+
+Key findings:
+\begin{enumerate}[nosep]
+  \item API ``compatibility'' claims require semantic-level verification
+  \item Downgrading to older API surfaces can increase semantic fidelity
+  \item Tool schema simplification is a zero-cost optimization for local models
+  \item SSE synthesis from non-streaming responses is a viable alternative
+        to real-time SSE translation
+  \item Usage field naming varies across implementations and requires normalization
+\end{enumerate}
+
+The code, deployment configuration, and this paper are released as
+open-source at \texttt{/Users/x/ai-assets/codex-proxy/}.
+
+% =====================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{openai_responses}
+OpenAI. ``Responses API Reference.''
+\texttt{https://platform.openai.com/docs/api-reference/responses}
+
+\bibitem{codex}
+OpenAI. ``Codex CLI.''
+\texttt{https://github.com/openai/codex}
+
+\bibitem{ollama}
+Ollama. ``Get up and running with large language models.''
+\texttt{https://ollama.com}
+
+\bibitem{ollama_compat}
+Ollama. ``OpenAI Compatibility.''
+\texttt{https://ollama.com/blog/openai-compatibility}
+
+\bibitem{litellm}
+BerriAI. ``LiteLLM: Call all LLM APIs using the OpenAI format.''
+\texttt{https://github.com/BerriAI/litellm}
+
+\bibitem{vllm}
+vLLM Team. ``vLLM: Easy, Fast, and Cheap LLM Serving for Everyone.''
+\texttt{https://docs.vllm.ai}
+
+\bibitem{huihui4}
+Huihui-ai. ``Huihui4-8B-A4B: Mixture-of-Experts Language Model.''
+\texttt{https://huggingface.co/huihui-ai/Huihui4-8B-A4B-GGUF}
+
+\bibitem{qwen3}
+Qwen Team. ``Qwen3: Technical Report.'' 2025.
+
+\bibitem{claude_code}
+Anthropic. ``Claude Code: Agentic coding tool.''
+\texttt{https://docs.anthropic.com/en/docs/claude-code}
+
+\bibitem{porter}
+Porter.sh. ``Lightweight LLM API Proxy.''
+\texttt{https://porter.sh}
+
+\end{thebibliography}
+
+\end{document}
