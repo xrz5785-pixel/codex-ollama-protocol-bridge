@@ -158,9 +158,14 @@ codex-proxy/
     └── arxiv-submit.zip         # arXiv submission package
 ```
 
-## Paper
+## Paper & Blog
 
-See `paper/technical-report.md` for the full academic paper, or `paper/technical-report-zh.md` for the Chinese version.
+| Type | Language | Link |
+|------|----------|------|
+| Technical Report | English | [paper/technical-report.md](paper/technical-report.md) |
+| Technical Report | 中文 | [paper/technical-report-zh.md](paper/technical-report-zh.md) |
+| LaTeX Preprint | English | [paper/paper.tex](paper/paper.tex) → [paper.pdf](paper/paper.pdf) |
+| Blog Post | 中文 | [掘金：让本地模型在 Codex 里调用工具](https://juejin.cn/post/7641409122262040582) |
 
 ```
 @misc{xuanyuan2026ptb,
