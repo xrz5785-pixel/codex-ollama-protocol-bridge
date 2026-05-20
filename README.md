@@ -182,7 +182,14 @@ codex-proxy/
 
 ### Running Tests
 
-Manual end-to-end test:
+**Unit tests** (pure functions, no Ollama needed):
+
+```bash
+python3 -m pytest test_proxy.py -v
+# 20 tests: normalize_usage, simplify_tools, responses_to_chat
+```
+
+**End-to-end test** (requires running Ollama):
 
 ```bash
 # Terminal 1: Start Ollama
